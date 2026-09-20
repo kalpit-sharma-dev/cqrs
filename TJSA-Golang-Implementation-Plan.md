@@ -4,7 +4,7 @@
 
 **Estate (Volume X, binding):** existing RBI-compliant mobile + IB apps; GCP multi-cluster GKE + ASM/Istio; edge GLB → FW → WAF → ILB → NGINX → ALB → Istio; Cloud Logging + Pub/Sub → BigQuery; 15+ crore envelopes in ~12 daytime hours; **12,000 events/s peak**.
 
-**Plan version:** 2.0 — adds the full Volume III requirements register (227 IDs) mapped to phases, deployables, APIs, data, and exit gates. v1.0 was a service-and-phase skeleton only.
+**Plan version:** 2.2 — CQRS Query/Command planes + RAG as LLM knowledge base (aligned with Blueprint v2.4); backend-only start; full Volume III register mapped.
 
 ---
 
@@ -60,7 +60,7 @@ Everything is Go except one Node build tool. One monorepo (`tjsa/`), hexagonal l
 | 7 | `transaction-intelligence` | `cmd/transaction-intelligence` | `resolveJourney`, `getJourneyTrace`, `getFinancialState`, RCA, state engine (§20, §24) | 0 → 1 | evidence-service, PG, core status APIs |
 | 8 | `evidence-service` | `cmd/evidence-service` | Curated evidence over BQ + Logging + Redis (X.5) | 0 | BQ, Cloud Logging, Redis, PG |
 | 9 | `taxonomy-service` | `cmd/taxonomy-service` | Rules lookup, templates, gap logging (§23) | 0 | PG, Redis |
-| 10 | `knowledge-service` | `cmd/knowledge-service` | RAG + source/version filters (§16, §37) | 1 | PG + pgvector, Neo4j |
+| 10 | `knowledge-service` | `cmd/knowledge-service` | **RAG knowledge base for the LLM** — retrieve/filter/pack/cite (Blueprint §16.3); never financial truth | 0 (schema/ingest) → 1 (live) | PG + pgvector, Neo4j |
 | 11 | `ui-guidance-service` | `cmd/ui-guidance-service` | Deep links, Task Guidance Engine, prerequisites, rail advisor (§19) | 1 | PG, Redis, Pub/Sub, tool-gateway |
 | 12 | `case-service` | `cmd/case-service` | Idempotent tickets, adapters (§28) | 1 | PG, ticketing |
 | 13 | `action-workflow` | `cmd/action-workflow` + `cmd/action-worker` | Action Registry, Temporal, idempotency ledger (§27, V.12) | 2 | Temporal, PG, step-up, bank APIs |
@@ -106,7 +106,7 @@ Standard libraries (Blueprint V.2): `chi`, `connectrpc.com/connect`, `pgx/v5` + 
 | `tool-plane` | tool-gateway + OPA embedded + prompt-registry | 0 |
 | `model-gateway` | alone (B1) | 0 |
 | `intelligence` | transaction-intelligence + journey-intelligence + evidence-service + taxonomy-service. `evidence-ingest` = same image, separate Deployment | 0 (ingest: 2) |
-| `guidance` | knowledge-service + ui-guidance-service | 1 |
+| `guidance` | knowledge-service (**RAG KB for LLM**) + ui-guidance-service | RAG + deep links + task procedures; Query plane only | 0–1 |
 | `actions` | action-workflow + worker + case-service + incident-service | 2 |
 | `governance` | admin-api + audit **read/export**; audit **writer** separate (B3) | 0 |
 | CronJobs | kg-ingest, code-intelligence-indexer, learning-pipeline, ui-knowledge-publisher | 0 / 5 |
@@ -119,9 +119,9 @@ Phase 0–1 = 6 deployables; Phase 2 adds `actions` + `evidence-ingest`.
 
 | Phase | Weeks | Autonomy | Backend deliverables | Gate owner |
 |---|---|---|---|---|
-| 0 Foundation | 8–12 | — | Platform skeleton, correlation, taxonomy UPI+IMPS, evidence lazy path, audit, policy, tool-gateway | CTO / EA |
-| 1 Explain-only MVP | 12–16 | L0 | Conversation API, EXPLAIN+GUIDE+INFORM, tickets, deep links; payments rails | Digital Banking + Risk |
-| 2 Safe actions | 12–20 | L1 | Action Registry + Temporal, T-2 ingest, incidents, cards/beneficiaries/mandates | Risk + Security |
+| 0 Foundation | 8–12 | — | Platform skeleton, **CQRS `/q`+`/c` stubs**, correlation, taxonomy UPI+IMPS, evidence lazy path, **RAG schema+ingest**, audit, policy, tool-gateway | CTO / EA |
+| 1 Explain-only MVP | 12–16 | L0 | **Query plane** EXPLAIN+GUIDE+INFORM + **RAG live**; **Command** tickets/escalate; payments rails | Digital Banking + Risk |
+| 2 Safe actions | 12–20 | L1 | **Command plane** Action Registry + Temporal, T-2 ingest, incidents, cards/beneficiaries/mandates | Risk + Security |
 | 3 Domain expansion | 12–14 | L1 | Deposits, loans, KYC, disputes — **content + tools, no new services** | Product + Compliance |
 | 4 Contact-centre copilot | 8–10 | L1 | Ops copilot APIs, investigation console backend | Contact Center |
 | 5 Expanded autonomy | 12+ | L2 | L2 actions, learning pipeline, proactive pilots | Risk Committee |
@@ -196,7 +196,7 @@ Each item: scaffold → unit → testcontainers → UAT behind Istio.
 |---|---|---|
 | `agent-gateway` (`agent-api`) | `POST /v1/tjsa/converse` (SSE), existing JWT validation, session store, per-device limits, channel adapter RN+IB | FR-001, SEC-001, SEC-009, SEC-012, PR-001, PR-002, CP-006 |
 | `agent-orchestrator` (`agent-api`) | 15-state investigation SM; intent classifier (II.2.3); planner with tool budget; II.5 / II.5.1 response composer (money position first); one clarifying question; mode switch; `talk to a human` same-turn; FAILED_SAFE | FR-002, FR-019, FR-020, FR-023, FR-024, AG-001, AG-004, AG-005, AG-012, AG-013, AG-014, AI-001, AI-012, PR-003, PR-007, PR-012 |
-| `knowledge-service` (`guidance`) | pgvector RAG, provenance/version, personal limits via `getCustomerContext` only | AI-003, PR-017, NFR-015, GOV-004, DATA-003, DATA-018 |
+| `knowledge-service` (`guidance`) | **RAG KB for LLM**: pgvector retrieve → context pack → citations; provenance/version; personal limits via `getCustomerContext` only (not RAG) | AI-003, PR-017, NFR-015, GOV-004, DATA-003, DATA-018, §16.3 |
 | `ui-guidance-service` (`guidance`) | `getUIDeepLink`, stale-route, `getTaskGuidance`, `getNextStep`, `checkTaskPrerequisites`, rail/option **rules table** (not LLM), guided-session store | FR-013, FR-021, FR-022, PR-005, PR-006, PR-015, PR-016, PR-018, UI-004, UI-005, UI-007, UI-008, UI-009, UI-011, UI-014, DATA-020 |
 | `case-service` (`actions` later; Phase 1 can live in `guidance` or a small extra binary until Phase 2) | Idempotent `createTicket` + SLA + evidence bundle; `escalateToHuman` | FR-010, FR-020, BR-007, BR-014, PR-008, PR-009, PR-010, DATA-008, OBS-010 |
 
@@ -777,6 +777,150 @@ Maps Blueprint VII.8 to this plan:
 
 Blueprint I.11 + Volume X E-1…E-9, especially: LLM hosting / residency (E-4, CP-007); Pub/Sub **attribute** producer change (E-7, OBS-004); BQ partition/clustering as-is vs C4–C7 (E-8); dedicated host vs path (E-1); envelope vs parallel topic (E-2).
 
+**These do not block starting Phase 0 Go code.** They block *production* LLM, *EXPLAIN* answers, and *ticket* adapters. Use the defaults in §16 until owners confirm.
+
 ---
 
-*Plan v2.0 — full Volume III register mapped. Re-baseline weeks after Phase 0 discovery (Blueprint VII.1). Channel UX (chat sheet, CTA, deep-link handler) is out of Go scope but the APIs those screens call are in this plan (PR-001, PR-002).*
+## 16. Backend-only start — UI is out of this workstream
+
+**Decision (binding for this delivery):** no React / React Native / ops-console UI will be built by the backend team. Frontend developers own all channel surfaces (PR-001, PR-002 chat sheet, “Explain this txn” CTA, deep-link handler, later ops console). Backend owns every Go service, API, schema, tool, and gate in this plan.
+
+### 16.1 Can coding start now?
+
+| Question | Answer |
+|---|---|
+| Start **Phase 0** backend in Go this week, with no UI? | **Yes.** Phase 0 has no customer screen. Prove it with `curl` / Connect clients / the admin JourneyTrace API. |
+| Start coding the **entire** backend (Phases 0–5) in one go? | **No.** Phase 1+ needs a frozen converse contract, taxonomy seed, and (for production LLM) hosting sign-off. Phase 2 needs Action Registry legal approval (I.11 #9). Phase 3–5 are content/config on the Phase 1–2 platform. |
+| Blocked on frontend? | **No.** FE can start later against the OpenAPI we publish in Phase 0 week 2. |
+| Blocked on open questions? | **Not for skeleton code.** Use the defaults below. Blocked only for *production* model calls, live tickets, and live actions. |
+
+### 16.2 Code in this order (no UI)
+
+**Week 1–2 (start immediately)**
+
+1. Repo: `tjsa/` monorepo, `cmd/` + `internal/` as §1, golang-migrate, sqlc, Buf, CI (lint, test, image).
+2. Shared libs: `internal/platform/{otel,logging,pubsub,pg,httpx,tokenizer}`, `internal/domain`.
+3. Deployables (clubbed, §1a): `audit-writer`, `tool-plane` (gateway + OPA + prompt-registry), `governance` (admin-api skeleton), `intelligence` (evidence lazy + taxonomy + `resolveJourney`/`getJourneyTrace` stubs), `model-gateway` skeleton with PII-reject tests (sandbox LLM or recorded fixtures — **no prod provider required**).
+4. Istio `/v1/tjsa/**` stubs + health/readiness in UAT.
+5. **Publish `openapi/tjsa-converse.v1.yaml`** (even if the handler returns 501) so FE can mock. This is the only backend→FE deliverable they need to start.
+
+**Still Phase 0, needs bank counterparts (not FE)**
+
+- Correlation headers through NGINX/Istio/services (Track A — platform/payments).
+- Pub/Sub attributes + BQ clustering (Track A).
+- Taxonomy seed workshop (UPI+IMPS SMEs).
+- `ui-knowledge-publisher` reads the **existing app repo** (routes/screens). Backend stores the registry; FE does not build a new UI for this.
+
+**Do not code yet**
+
+| Work | Why wait |
+|---|---|
+| Production `model-gateway` provider | I.11 #1 / E-4 residency |
+| `case-service` live adapter | I.11 #2 ticketing SoR — implement the **port**; adapter after decision |
+| `executeAction` / Temporal money-adjacent writes | I.11 #9 Action Registry approval — Phase 2 |
+| `agent-api` converse loop against a real LLM | After Phase 0 exit test (journey_id join) + golden fixtures |
+| Any RN/React/ops HTML | Explicitly out of scope |
+
+**Safe defaults until open questions close**
+
+| Open question | Code default |
+|---|---|
+| I.11 #1 / E-4 LLM hosting | Adapter interface + fixture/sandbox; swap provider without rewrite |
+| I.11 #2 Ticketing | `CasePort` interface; no-op/in-memory adapter |
+| I.11 #3 Voice | Out of v1 — no code |
+| I.11 #4 Locales | `en-IN` templates only; registry is locale-keyed |
+| I.11 #5 Volume rails | UPI + IMPS first |
+| E-1 Host vs path | Path prefix `/v1/tjsa/` on existing app host |
+| E-7 Pub/Sub attributes | Schema + subscriber filter ready; producers can lag — lazy BQ path still works |
+
+### 16.3 Contract to hand the frontend team (when they start)
+
+Backend freezes and versions this; FE does not invent it. **CQRS paths (Blueprint §14.1.3 / X.11) are the contract of record.**
+
+| Item | Notes |
+|---|---|
+| **Query** `POST /v1/tjsa/q/converse` | SSE; existing channel JWT; body: `{conversation_id?, message, locale, channel, app_version, transaction_id?}` — EXPLAIN/GUIDE/INFORM |
+| **Query** `GET /v1/tjsa/q/conversations/{id}` | Resume |
+| **Query** `GET /v1/tjsa/q/journeys/{ref}` | Optional status/timeline (no LLM) |
+| **Command** `POST /v1/tjsa/c/tickets` | Idempotency-Key; create ticket |
+| **Command** `POST /v1/tjsa/c/actions` | Idempotency-Key; confirmation token; execute whitelisted action |
+| **Command** `POST /v1/tjsa/c/escalate` | Human handoff |
+| Legacy alias | `POST /v1/tjsa/converse` → Query until FE cut-over |
+| Response envelope | II.5 / II.5.1: `mode`, `money_position`, `explanation`, `next_step` (`deep_link` \| `command_offer` \| `ticket` \| `none`), `taxonomy_id`, `confidence`, `citations[]` (RAG `source_id`+version), `ticket_ref?` |
+| Deep links | `bankapp://…` / web routes from `getUIDeepLink` — FE **handles**; backend **resolves** |
+| Errors | `FAILED_SAFE`, `CLARIFY` (2–3 candidates), `ESCALATE` |
+| Out of FE scope | Tools, BQ, taxonomy, RAG corpus, audit, kill switch, model |
+
+FE can develop the chat sheet against a stub/mock of this spec in parallel with Phase 1 backend. **No FE work is required to start or finish Phase 0.**
+
+---
+
+## 17. CQRS + RAG (both available — binding)
+
+Aligned with Blueprint v2.4 §§14.1.3, 16.3, X.11. **Both are in scope for this backend workstream.** UI remains FE-owned.
+
+### 17.1 CQRS package / API layout
+
+```
+cmd/agent-gateway/          # routes /q/** and /c/** to orchestrator modes
+internal/query/             # converse query, journey read, response composer
+internal/command/           # tickets, actions, escalate, idempotency
+internal/readmodel/         # JourneyReadModel, TransactionReadModel, TaskSessionReadModel
+internal/projection/        # Pub/Sub → PG (evidence-ingest)
+internal/knowledge/         # RAG retrieve, pack, cite (knowledge-service)
+```
+
+| Plane | Go packages | Deployable | Phase live |
+|---|---|---|---|
+| Query | `internal/query`, `internal/readmodel`, `internal/knowledge`, intelligence tools | `agent-api` + `intelligence` + `guidance` + `model-gateway` | P1 (skeleton P0) |
+| Command | `internal/command`, action-workflow, case-service | `agent-api` + `actions` + `tool-plane` | P1 tickets; P2 actions |
+| Shared | tool-gateway classes (query vs command), audit, policy | `tool-plane`, `audit-writer` | P0 |
+
+**Hard rules in code**
+
+1. Query handlers register only query tool classes; command handlers only command tools — enforced in `tool-gateway` (AG-003).
+2. `model-gateway` is called from Query path; Command path may call LLM only to *draft* confirmation copy, never to authorize a write.
+3. After every successful command, call Query `getFinancialState` (or ticket get) before telling the customer it worked (FR-018).
+
+### 17.2 RAG knowledge base for the LLM (implement)
+
+| Work | Phase | Detail |
+|---|---|---|
+| PG schema `kb_document`, `kb_chunk` (embedding vector, source_id, version, authority, locale, domain, valid_from/to) | 0 | DATA / AI-003 |
+| Ingest job: approve → PII scan → chunk → embed → upsert | 0 | Document pipeline; night trough for reindex |
+| `knowledge-service` APIs: `Retrieve(query, filters) → ContextPack` | 0–1 | Used only by Query tools |
+| Tool `getProductFact` + internal retrieve for EXPLAIN/INFORM | 1 | PR-017 |
+| Prompt templates require pack grounding; grounding evaluator in CI | 1 | AI-010, QA-004 |
+| Seed corpus: product limits/charges/cut-offs, IMPS/UPI how-to narrative, explanation templates | 1 | SME + Compliance |
+| Expand corpus per domain wave | 3 | BR-012 |
+
+**Not in RAG:** balances, txn state, RCA codes, action permissions — those stay taxonomy/state/Action Registry.
+
+**Context pack shape (to Model Gateway):**
+
+```json
+{
+  "chunks": [
+    {"source_id": "prod.imps.limits", "version": "2026.09", "authority": "product", "text": "..."}
+  ],
+  "token_budget_used": 1200
+}
+```
+
+### 17.3 Phase wiring
+
+| Phase | CQRS | RAG |
+|---|---|---|
+| 0 | `/q` and `/c` route stubs; read-model tables; projection interface | Schema + ingest + empty/seed index; PII-reject tests |
+| 1 | Query live (EXPLAIN/GUIDE/INFORM); Command: tickets + escalate | Live INFORM + EXPLAIN enrichment; citations in audit |
+| 2 | Command: Action Registry + Temporal | Corpus growth; ops-only runbook collection |
+| 3+ | Same planes; more domain read models | Domain KB packs |
+
+### 17.4 Requirements touched
+
+CQRS: BR-001, BR-006, FR-001–024 (split by plane), AG-002/003/011, SEC-002/009, NFR-001–004.  
+RAG: AI-003, AI-010, PR-017, GOV-004, NFR-015, DATA-013 (KB side), OPS-010, CP-002/005.
+
+---
+
+*Plan v2.2 — CQRS + RAG both available; backend-only start; UI out of this workstream. Re-baseline weeks after Phase 0 discovery (Blueprint VII.1).*

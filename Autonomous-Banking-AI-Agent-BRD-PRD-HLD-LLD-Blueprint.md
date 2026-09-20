@@ -7,7 +7,7 @@
 | Field | Value |
 |---|---|
 | Document status | Architecture baseline / implementation-ready specification |
-| Version | 2.3 (supersedes ChatGPT-generated Master Specification v1.0 and TJSA PRD Draft v1; 2.1 = completeness pass against S3 master prompt; 2.2 = GUIDE/INFORM help modes — how-to task guidance; 2.3 = brownfield integration with the bank's existing GCP estate, Volume X) |
+| Version | 2.4 (supersedes ChatGPT-generated Master Specification v1.0 and TJSA PRD Draft v1; 2.1 = completeness pass against S3 master prompt; 2.2 = GUIDE/INFORM help modes — how-to task guidance; 2.3 = brownfield integration with the bank's existing GCP estate, Volume X; 2.4 = CQRS Query/Command planes + RAG as LLM knowledge base — both binding and available) |
 | Date | 19 September 2026 |
 | Product name | Autonomous Transaction & Journey Support Agent (TJSA) |
 | Channels in scope | Mobile Banking (React Native), Internet Banking (React); Contact Center copilot (Phase 4); IVR/WhatsApp (roadmap) |
@@ -101,6 +101,8 @@ Boundaries of the decision:
 | Telemetry / evidence store | ClickHouse/Elasticsearch (+ BigQuery analytics) | observability stores | ClickHouse | **S5: Cloud Logging + Pub/Sub → BigQuery is the telemetry plane.** The Evidence Service queries BigQuery (hot, partitioned) and the Cloud Logging API instead of ClickHouse; no new store is built unless evidence-query latency SLOs are missed (fallback OPTION: BigQuery BI Engine / a serving cache). Volume X §X.5. |
 | Edge / API gateway | Generic "API Gateway/WAF" | API gateway | API gateway | **S5: the existing edge chain (GLB → FW → WAF → ILB → NGINX → ALB → Istio/ASM) is the gateway.** TJSA is added as new Istio VirtualService routes behind the same chain; no new edge components. Volume X §X.2. |
 | Streaming/deployment platform | Kubernetes (GKE) | Kubernetes | GKE | **S5 confirms**: multi-cluster GKE + ASM; TJSA services deploy as ordinary workloads behind the mesh. Volume X §X.3. |
+| Application style for TJSA | Hybrid agent (implicit read/write asymmetry) | — | — | **DESIGN DECISION (v2.4): TJSA is also CQRS.** Explicit **Query plane** (`/v1/tjsa/q/**`) and **Command plane** (`/v1/tjsa/c/**`), with Pub/Sub→PG/BQ **read-model projections** and Action Registry/Temporal **command handlers**. Core banking remains SoR — TJSA does not re-implement payment CQRS. §14.1.3, Volume X §X.11. |
+| LLM knowledge base | RAG mentioned in §16.3 / AI-003 | — | — | **DESIGN DECISION (v2.4): RAG is the approved knowledge base for the LLM** (product facts, SOPs, templates, policies for phrasing). Financial truth and RCA remain deterministic (rules/state), never RAG. §16.3 expanded. |
 
 ## 0.6 Regulatory and control context (India)
 
@@ -125,6 +127,10 @@ Boundaries of the decision:
 | Term | Definition |
 |---|---|
 | TJSA | Autonomous Transaction & Journey Support Agent — the product |
+| CQRS (TJSA) | Command Query Responsibility Segregation applied to the **agent platform**: Query plane for explain/guide/inform/status; Command plane for tickets/actions; separate APIs, models, and scaling. Not a rewrite of core banking CQRS. |
+| Query plane | Read path: `/v1/tjsa/q/**`, read models (Redis T-1, PG T-2, BQ T-3), evidence, RAG, taxonomy lookup |
+| Command plane | Write path: `/v1/tjsa/c/**`, Action Registry, Temporal, action ledger, case create; never owned by the LLM |
+| RAG KB | Retrieval-Augmented Generation knowledge base (pgvector): versioned, authority-tagged chunks that ground the LLM — never the source of financial state or RCA |
 | Help modes | EXPLAIN / RESOLVE / GUIDE / INFORM / ACT / ESCALATE — the six ways the agent helps (II.2.0) |
 | GUIDE mode / Task Guidance | How-to assistance: prerequisite checks, exact channel/version steps, in-task next step, completion confirmation (§19.4) |
 | Task procedure | Versioned, per-channel ordered steps for a customer task (`task_procedure`) |
@@ -990,6 +996,68 @@ Together these form the **Customer Journey Digital Twin / Transaction Digital Tw
 
 The platform is event-driven at two levels. **Business events:** payment services (Go/Java) publish schema-registered lifecycle events on Kafka (`txn.lifecycle.v3`: initiated → processing → completed/failed → settled, plus pending/reversed/refunded); `transaction-intelligence` consumes them to maintain `txn_trace_map` and `transaction_event`, so the twin is built incrementally rather than by ad-hoc log queries at question time. **Agent events:** the orchestrator, taxonomy service and action workflow publish `tjsa.decision.v1`, `tjsa.gap.v1` and `tjsa.action.v1`; consumers include the audit service (durable write), analytics (BigQuery), alerting (`UNCLASSIFIED_ERROR` spikes, unsafe-action attempts) and the continuous-learning pipeline (§55). Long-running work (async investigations, status polling, case monitoring) is modelled as Temporal workflows triggered by events, never by the LLM. Exactly-once semantics are achieved with idempotent upserts keyed by event_id.
 
+### 14.1.3 CQRS architecture for TJSA (binding, v2.4)
+
+**DESIGN DECISION.** TJSA is implemented as **CQRS** at the agent-platform boundary. Both planes are available from Phase 1 (Query live; Command starts with ticket/escalate and expands in Phase 2). This does **not** mean core banking, ledger, or payment rails are re-architected as CQRS — those remain systems of record. TJSA projects **read models** from the existing event/telemetry stream and issues **commands** only through the Action Registry.
+
+#### Diagram 1b — CQRS planes
+
+```mermaid
+flowchart TB
+    FE[Channel - FE owns UI] --> QAPI["Query API /v1/tjsa/q/**"]
+    FE --> CAPI["Command API /v1/tjsa/c/**"]
+    QAPI --> QORCH[Orchestrator - query mode]
+    QORCH --> TGQ[Tool Gateway - query tool classes]
+    TGQ --> RM[Read models]
+    TGQ --> RAG[RAG KB - knowledge-service]
+    TGQ --> TAX[Taxonomy / state engine]
+    RM --> T1[(Redis T-1)]
+    RM --> T2[(PG hot T-2)]
+    RM --> T3[(BigQuery T-3)]
+    PS[(Pub/Sub events)] --> PROJ[Projection workers]
+    PROJ --> RM
+    CAPI --> CORCH[Orchestrator - command mode]
+    CORCH --> TGC[Tool Gateway - command tool classes]
+    TGC --> AW[Action Workflow / Temporal]
+    TGC --> CASE[Case Service]
+    AW --> BANK[Bank APIs / step-up]
+    AW --> LEDGER[(Action ledger)]
+    AW --> EVT[tjsa.action.v1] --> PROJ
+    QORCH --> MGW[Model Gateway + RAG context pack]
+    CORCH -.->|propose only - never execute| MGW
+```
+
+#### Query plane (reads)
+
+| Concern | Implementation |
+|---|---|
+| Public API | `POST /v1/tjsa/q/converse`, `GET /v1/tjsa/q/conversations/{id}`, `GET /v1/tjsa/q/journeys/{ref}`, status/timeline helpers |
+| Modes | EXPLAIN, GUIDE, INFORM (and RESOLVE when outcome is guidance-only) |
+| Tools | `getCustomerContext`, `resolveJourney`, `getJourneyTrace`, `getEvidence`, `getFinancialState`, `classifyRootCause`, `getExplanation`, `getUIDeepLink`, `getTaskGuidance`, `checkTaskPrerequisites`, `getNextStep`, `getProductFact`, `getActiveIncident`, RAG retrieve |
+| Read models | `JourneyReadModel`, `TransactionReadModel`, `TaskSessionReadModel` — served from Redis (T-1) / PG (T-2) / BQ (T-3) per Volume X §X.5 |
+| Scaling | Sized for conversation QPS and evidence lookups; HPA on active turns |
+| LLM | Allowed — synthesises explanation/guidance from **tool results + RAG context pack** only |
+
+#### Command plane (writes)
+
+| Concern | Implementation |
+|---|---|
+| Public API | `POST /v1/tjsa/c/actions`, `POST /v1/tjsa/c/tickets`, `POST /v1/tjsa/c/escalate` (idempotency-key required) |
+| Modes | ACT, ESCALATE, RESOLVE when a write is required |
+| Tools | `listAvailableActions`, `executeAction`, `createTicket`, `escalateToHuman`, `initiateDispute` |
+| Write model | Action Registry + Temporal workflows + `action_ledger` + case records; post-condition always verified via **Query** (`getFinancialState`) |
+| Scaling | Sized for action/ticket volume (orders of magnitude below query); stricter rate limits |
+| LLM | May **propose** a command; must **not** execute. Acceptance = confirmation token + policy + gateway |
+
+#### Hard rules
+
+1. No write tool is callable on `/q/**`; no evidence/RAG path on `/c/**` except post-condition query after a command.
+2. Conversational "please fix it" is accepted on `/q/converse` as intent, then the orchestrator returns a **command offer**; the client confirms on `/c/actions`.
+3. Tickets may be offered from Query mode but **created** only via Command API (or an internal command hop that still hits the action ledger).
+4. Core banking CQRS (if any) is independent; TJSA never becomes the payment write model.
+
+Estate mapping (paths, projections, Istio): Volume X §X.11. Implementation package layout: `TJSA-Golang-Implementation-Plan.md` §17.
+
 ### 14.2 Diagram 1 — Overall architecture
 
 ```mermaid
@@ -1364,11 +1432,76 @@ flowchart LR
 
 Automatic build and update: every source has a machine trigger (CI, release pipeline, webhook or stream); the pipeline validates, versions and publishes to the registries; SMEs enrich only the semantic layer (business meaning, customer text, action class). Publication to the customer-facing path is gated by the taxonomy CI rule and, for prompts/templates, by the golden-set regression.
 
-### 16.3 RAG pipeline
+### 16.3 RAG — LLM knowledge base (binding, v2.4)
 
-Approved source → ingestion → classification / PII scan → chunking / metadata extraction → embeddings → vector store → lexical index (BM25 where useful) → source authority + version metadata → retrieval policy (domain, locale, channel filters) → reranking → evidence/context pack → model → citation/evidence check → response policy. Retrieved content is tagged DATA, never COMMAND (SEC-006).
+**DESIGN DECISION.** **RAG is the knowledge base that serves the LLM.** The model must not answer product/policy/SOP/how-to facts from parametric memory. Every such claim is grounded in retrieved, versioned, authority-tagged chunks (or in a deterministic template from the taxonomy table). Financial state and root-cause classification remain **outside** RAG (rules table + authoritative APIs).
 
-**DESIGN DECISION:** RAG is used for *phrasing and guidance context* (templates, SOP snippets, product concepts such as hold vs settlement). It is never used to classify root cause — that is a rules-table lookup.
+RAG is available on the **Query plane** (`/v1/tjsa/q/**`) via `knowledge-service` and the tool `getProductFact` / internal `retrieveKnowledge`. The Command plane does not retrieve RAG to decide whether a write is allowed — policy/Action Registry decides that.
+
+#### 16.3.1 What lives in the RAG KB vs what does not
+
+| In RAG KB (vector + metadata) | Not in RAG (deterministic) |
+|---|---|
+| Product facts: limits, charges, cut-offs, cooling periods, eligibility copy | Transaction/journey state, debit/credit/settlement |
+| Customer explanation templates (locale), success concepts (hold vs settlement) | RCA: `(service, api, error_code)` → taxonomy_id |
+| Support SOPs, how-to narrative (supplements `task_procedure` steps) | Action eligibility, risk tier, kill switch |
+| Approved policy summaries for customer-safe phrasing | OPA policy evaluation, session auth |
+| Runbooks / regulatory digests (**internal / ops prompt only**) | Raw logs, BQ rows, PII |
+
+#### 16.3.2 Pipeline
+
+Approved source → ingestion → classification / PII scan → chunking / metadata extraction → embeddings → **pgvector** (MVP; OPTION: Vertex Vector Search at scale) → lexical index (BM25 where useful) → source authority + version + `valid_from`/`valid_to` + locale/channel/domain tags → retrieval policy → reranking → **context pack** (capped tokens) → Model Gateway → citation / grounding check → response policy.
+
+Retrieved content is tagged **DATA**, never COMMAND (SEC-006). Stale or unapproved documents are excluded from retrieval (NFR-015, GOV-004).
+
+#### Diagram 7b — RAG as LLM knowledge base
+
+```mermaid
+flowchart LR
+    DOC[Approved docs - product SOP policy template] --> ING[Ingest: PII scan chunk embed version]
+    ING --> VEC[(pgvector KB)]
+    ING --> META[(chunk metadata - source_id version authority locale)]
+    Q[Query plane orchestrator] --> KS[knowledge-service]
+    KS --> VEC
+    KS --> META
+    KS --> PACK[Context pack + citations]
+    PACK --> MGW[Model Gateway]
+    MGW --> LLM[LLM]
+    LLM --> VAL[Grounding check - every fact has source_id]
+    TAX[Taxonomy templates] -.->|merge for EXPLAIN| PACK
+    PROC[task_procedure steps] -.->|GUIDE prefers registry| Q
+```
+
+#### 16.3.3 Serving the model
+
+| Step | Rule |
+|---|---|
+| When to retrieve | INFORM always; EXPLAIN for template enrichment after taxonomy hit; GUIDE for narrative hints only if `task_procedure` is missing a step explanation; never instead of `getFinancialState` |
+| Filters | domain, locale, channel, app/web version range, audience (`customer` vs `ops`), authority ≥ threshold |
+| Context pack | Max N chunks / token budget; each chunk: `{source_id, version, title, text, authority}` |
+| Model contract | Prompt instructs: use only pack + tool DATA; if pack empty for a fact question → say unknown / ticket, do not invent |
+| Citation | Customer may see soft attribution ("per current product schedule"); audit always stores `source_id` + version |
+| Personal limits | From `getCustomerContext`, **not** from RAG |
+
+#### 16.3.4 Ingest & governance
+
+- Maker-checker approval before a document enters the customer retrieval set (OPS-013, GOV-004).
+- PII scan at ingest; reject chunks with account/PAN patterns.
+- Expiry / review date; night job quarantines stale sources (OPS-010).
+- Golden-set gate on prompt or corpus change (GOV-011): 0 facts from model memory (PR-017 acceptance).
+- No automatic training on production conversations (CP-005); corpus updates are curated.
+
+#### 16.3.5 Go ownership
+
+| Component | Role |
+|---|---|
+| `knowledge-service` | Retrieve, filter, pack, cite; tool handlers |
+| `kg-ingest` / document pipeline | Chunk, embed, version into pgvector |
+| `model-gateway` | Injects pack into prompt; rejects untokenised PII |
+| `prompt-registry` | System prompts that mandate pack grounding |
+| pgvector on PostgreSQL | MVP store (same estate as registries) |
+
+**DESIGN DECISION (restated):** RAG grounds *phrasing and approved knowledge*. It never classifies root cause and never asserts money movement.
 
 ## §17 API Intelligence
 
@@ -5058,7 +5191,7 @@ Additional S3 §1 objective items without a numbered §58 slot: Customer-context
 | 65 | Sample Dashboards | §46, I.10 |
 | 66 | Final Recommendations | I.12 |
 
-Diagram index (S3 §57 minimum set): 1 Overall architecture (§14.2) · 2 Customer request flow (§14.3) · 3 Agent orchestration flow (§25.1) · 4 Transaction investigation flow (§20.5) · 5 API intelligence architecture (§17.3) · 6 Observability architecture (§21.1) · 7 Knowledge architecture (§16.2) · 8 Knowledge graph (§37.3) · 9 UI guidance architecture (§19.2) · 10 Corrective action architecture (§27.1) · 11 Ticketing architecture (§28.1) · 12 Security architecture (§30.1) · 13 Deployment architecture (§49) · 14 Data flow (§14.4) · 15 Incident correlation flow (§39) · 16 End-to-end transaction reconstruction (§20.3) · 17 Multi-channel architecture (§41) · 18 Estate traffic insertion (X.2) · 19 Estate evidence plane (X.5) · plus state diagram (§24.2), ER model (§15.1), conversation contract (II.3), continuous-learning loop (§55), Gantt (VII.1), final architecture (I.12).
+Diagram index (S3 §57 minimum set): 1 Overall architecture (§14.2) · 1b CQRS planes (§14.1.3) · 2 Customer request flow (§14.3) · 3 Agent orchestration flow (§25.1) · 4 Transaction investigation flow (§20.5) · 5 API intelligence architecture (§17.3) · 6 Observability architecture (§21.1) · 7 Knowledge architecture (§16.2) · 7b RAG LLM knowledge base (§16.3) · 8 Knowledge graph (§37.3) · 9 UI guidance architecture (§19.2) · 10 Corrective action architecture (§27.1) · 11 Ticketing architecture (§28.1) · 12 Security architecture (§30.1) · 13 Deployment architecture (§49) · 14 Data flow (§14.4) · 15 Incident correlation flow (§39) · 16 End-to-end transaction reconstruction (§20.3) · 17 Multi-channel architecture (§41) · 18 Estate traffic insertion (X.2) · 19 Estate evidence plane (X.5) · plus state diagram (§24.2), ER model (§15.1), conversation contract (II.3), continuous-learning loop (§55), Gantt (VII.1), final architecture (I.12).
 
 Source coverage: S1 PRD §1–§17 (I.1–I.5, I.8, §14, §17, §22, §26, II.8, II.9, III.0, VII, VII.9, I.11); S2 system prompt (I.1 verbatim + extensions); S3 65 sections (this matrix); S4 §1–§29 + Appendices A–D (0.6, I.7, I.10, III.1–III.15, II.2–II.5, §14.5, §15, §24, §17.1, §21.1–21.4, §26, §25.2–25.3, §30, §33.1, V.1, V.15, V.11, §23, §16, §19, §27, §28, §29, VIII.1–VIII.2, V.17, VI.6, II.9, §49, §50, I.8, VII, VII.10, I.9, I.10, I.11, I.12, I.1, I.3, I.4, VII.8, 0.6); S5 bank estate facts (Volume X, 0.5 reconciliations, §21.1, §49, §IP, §51, VII.2 estate adaptations).
 
@@ -5337,6 +5470,51 @@ Every hop must **forward** (never strip, never regenerate) `x-journey-id`, `trac
 | E-7 | Are the X.4 filter keys (`event_class`, `rail`, `lifecycle_stage`, `success`) settable as **message attributes** by today's producers, or is a producer-library change needed first? (Determines whether C2 filtering is a config change or a Phase 0 code change) | Platform + payments |
 | E-8 | Current BQ telemetry tables: partitioning/clustering scheme, storage billing model (logical vs physical), and raw retention — what must change to meet C4–C7? | Data platform |
 | E-9 | Is the existing Pub/Sub→BQ hop direct (BigQuery subscription) or via Dataflow? (Affects C3 and where enrichment fields are added) | Data platform |
+
+## X.11 CQRS + RAG on this estate (binding, v2.4)
+
+Both capabilities are **available and mandatory** for TJSA on this bank's stack. They compose with — and do not replace — Volume X §§X.1–X.10.
+
+### X.11.1 CQRS path mapping
+
+| Plane | Istio / public path | Deployables (clubbed) | Data |
+|---|---|---|---|
+| **Query** | `/v1/tjsa/q/**` (and legacy alias `/v1/tjsa/converse` → query until FE cuts over) | `agent-api` (query mode), `intelligence`, `guidance` (incl. `knowledge-service`), `model-gateway` | Read models T-1/T-2/T-3 from Pub/Sub projections + RAG KB |
+| **Command** | `/v1/tjsa/c/**` | `agent-api` (command mode), `actions`, `tool-plane` | Action ledger, Temporal, case SoR; post-check via Query |
+
+NGINX: separate rate-limit buckets — chat turns (query) vs action confirms (command, stricter). Same device-id→bucket hashing for canary.
+
+VirtualService sketch (additive to X.2):
+
+```yaml
+http:
+  - match: [{ uri: { prefix: "/v1/tjsa/q/" } }]
+    route: [{ destination: { host: agent-gateway.agent-platform.svc.cluster.local } }]
+  - match: [{ uri: { prefix: "/v1/tjsa/c/" } }]
+    route: [{ destination: { host: agent-gateway.agent-platform.svc.cluster.local } }]
+    # stricter outlier / timeout policy for commands optional
+```
+
+Projections: filtered Pub/Sub → `evidence-ingest` → PG read models (X.5); command outcomes publish `tjsa-action-v1` and update the same read models. Queries never call payment write APIs for diagnosis.
+
+### X.11.2 RAG knowledge base on GCP
+
+| Item | Choice on this estate |
+|---|---|
+| Vector store | **PostgreSQL + pgvector** in the existing PG estate (MVP). OPTION: Vertex AI Vector Search if QPS/size outgrows PG |
+| Embeddings | In-region embedding API (same residency decision as E-4 / I.11 #1) or in-VPC model |
+| Corpus location | Approved docs → GCS → ingest job → pgvector; metadata in PG |
+| Serving | `knowledge-service` inside `guidance` deployable; only Query plane tools call it |
+| IAM | `knowledge-service` read on vector tables; `model-gateway` still has **no** BQ/Logging IAM and receives only the **context pack**, not raw corpus dumps |
+| Night trough | Re-embed / reindex / quarantine stale docs scheduled off-peak (C12) |
+
+### X.11.3 Availability matrix
+
+| Capability | Phase 0 | Phase 1 | Phase 2+ |
+|---|---|---|---|
+| CQRS Query plane | Skeleton APIs + read-model schemas | Live EXPLAIN/GUIDE/INFORM | Full |
+| CQRS Command plane | Ports + no-op adapters | Tickets + escalate | Action Registry + Temporal |
+| RAG KB | Schema + ingest pipeline + seed product docs | Live INFORM + EXPLAIN enrichment | Domain corpus expansion |
 
 ---
 
