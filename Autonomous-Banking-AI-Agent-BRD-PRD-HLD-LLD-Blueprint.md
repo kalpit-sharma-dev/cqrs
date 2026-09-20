@@ -4092,7 +4092,7 @@ gantt
 
 **Objective.** Make the estate diagnosable before any AI is added; stand up the Go platform skeleton.
 
-> **Estate adaptation (S5, binding).** On this bank's stack, Phase 0 concretely means: (a) W0.1 propagates `x-journey-id`/`traceparent` through **NGINX → ALB → Istio → services** and into **Cloud Logging labels and the existing per-request Pub/Sub envelope**; (b) W0.2's "Kafka `txn.lifecycle.v3`" is a **new/enriched Pub/Sub topic** — the existing API req/resp envelope is necessary but not sufficient (it lacks rail, error code, debit state, lifecycle stage); (c) W0.6's Evidence Service is built as a **BigQuery + Cloud Logging adapter**, not ClickHouse; (d) Istio VirtualService/DestinationRule routes for TJSA stubs are stood up in this phase so later phases are pure workload deployments. Details and schemas: Volume X §X.4–X.7.
+> **Estate adaptation (S5, binding).** On this bank's stack, Phase 0 concretely means: (a) W0.1 propagates `x-journey-id`/`traceparent` through **NGINX → ALB → Istio → services** and into **Cloud Logging labels and the existing per-request Pub/Sub envelope**; (b) W0.2's "Kafka `txn.lifecycle.v3`" is a **new/enriched Pub/Sub topic** — the existing API req/resp envelope is necessary but not sufficient (it lacks rail, error code, debit state, lifecycle stage); (c) W0.6's Evidence Service is built as a **BigQuery + Cloud Logging adapter in lazy-hydration mode** (X.5.1 — Redis cache + on-demand clustered BQ lookups; no firehose ingest at 15-crore/day volume, X.5.4), not ClickHouse; (d) Istio VirtualService/DestinationRule routes for TJSA stubs are stood up in this phase so later phases are pure workload deployments. Details and schemas: Volume X §X.4–X.7.
 
 **Entry criteria.** Executive sponsor; open questions #1–#3 owners assigned; access to OpenAPI/Java contracts and observability stack.
 
@@ -5090,6 +5090,7 @@ This volume is **binding** for this bank's deployment. It answers one question �
 | E4 | Edge chain: **User App → GLB (managed by network team, no direct access) → firewall rule matching → WAF → ILB L7 (equal distribution, unmanaged instance group of VMs) → NGINX (reverse proxy; rate limiting e.g. OTP/GET 10/min; device-id hashed to bucket-id) → ALB L7 with NEGs (host routing e.g. UAT1/mby3; header-based routing e.g. `put=true`; regex match on bucket-id range decides route) → Istio ingress gateway → ASM gateway → VirtualService (paths, destination rules) → service** |
 | E5 | Application and service logs in **Cloud Logging** |
 | E6 | For **every** request, an API envelope (request/response metadata, success/failure, start/end timestamps) is published to **Pub/Sub**, then lands in **BigQuery** for querying and analysis |
+| E7 | **Scale: 15+ crore (150M+) envelope records in the ~12 daytime hours** for the mobile app alone (success + failure); night-time volume is a small fraction (customers asleep). The load is strongly **diurnal**: ≈ 3,500/s average across the day window, with a stated **intraday peak of 12,000 events/s** (lunch/evening, salary days, bill-due and festival days). All evidence-plane design in X.4–X.5 is sized against the **12k/s peak**, priced against the **average**, and exploits the **night trough** for batch work. |
 
 ## X.2 Traffic insertion — TJSA behind the existing edge
 
@@ -5191,30 +5192,88 @@ spec:
 
 Existing fields (req/resp metadata, success/failure, start/end timestamps) are retained. PII rule unchanged: identifiers tokenised at source, payload bodies never published (DATA-xxx, §22).
 
-## X.5 Evidence Service over BigQuery + Cloud Logging
+**Scale rule — attributes, not payload (binding at E7 volume).** The fields TJSA filters on (`event_class`, `rail`, `lifecycle_stage`, `success`) MUST be set as **Pub/Sub message attributes**, not only payload fields, because Pub/Sub subscription filters operate on attributes. This single decision is what allows TJSA to subscribe to a small slice of the 15-crore/day firehose instead of consuming and discarding all of it (X.5.2). Add one attribute:
 
-**DESIGN DECISION (binding).** No ClickHouse/Elasticsearch build. The Evidence Service (`evidence-service`, §21.4, V) is implemented as an adapter over the estate's three data planes, with a small hot serving store for latency:
+| Attribute | Values | Purpose |
+|---|---|---|
+| `event_class` | `payment_lifecycle` / `journey_step` / `api_envelope` | First-level filter key: TJSA's hot ingest wants `payment_lifecycle` (and failures); plain `api_envelope` success traffic — the overwhelming majority of E7 — is never delivered to TJSA subscriptions |
 
-### Diagram 19 — Estate evidence plane
+## X.5 Evidence Service over BigQuery + Cloud Logging — high-scale, low-cost design (15+ crore events/day)
+
+**DESIGN DECISION (binding).** No ClickHouse/Elasticsearch build, and — at E7 volume — **no full-firehose materialisation into any OLTP store**. The governing principle is:
+
+> **Ingest almost nothing, look up on demand, cache what the conversation reuses.** TJSA's evidence need is driven by *customer questions* (thousands–lakhs/day), not by *traffic* (15 crore/day). The design must scale with questions, never with the firehose.
+
+### X.5.1 Three-tier evidence access
+
+| Tier | Store | What it holds | Feed | Serves | Latency |
+|---|---|---|---|---|---|
+| T-1 Conversation cache | **Redis** (existing pattern) | Fully assembled `JourneyTrace` / Evidence Objects for transactions currently being discussed | Written by `evidence-service` on first resolution; TTL = conversation window (e.g. 2 h) | Every turn after the first — the common case (multi-turn conversations re-query the same txn) | ≤ 20 ms |
+| T-2 Hot state store | **PostgreSQL** (`txn_trace_map`, `transaction_event`, daily-partitioned) | **Only** `event_class = payment_lifecycle` events + failure envelopes for in-scope rails — the filtered slice (X.5.2), NOT the 15-crore firehose | Filtered Pub/Sub subscription | `resolveJourney` / `getFinancialState` for recent payments (P95 ≤ 800 ms, §26); lifecycle state machine (§24) | ≤ 100 ms |
+| T-3 System of record | **BigQuery** (existing dataset) | Everything, as today — full envelope history | Existing Pub/Sub→BQ pipeline (sunk cost; unchanged) | First-turn lookups for non-payment journeys, history beyond hot retention, taxonomy gap mining, golden-set mining, KPIs | 1–4 s (acceptable on first turn with the streaming/async UX, §26; results cached to T-1) |
+
+**Lazy-hydration rule:** when a question arrives about a transaction not in T-2 (old, non-payment, or pre-filter era), `evidence-service` runs **one clustered point-lookup** in BigQuery, assembles the trace once, and caches it in T-1. No standing pipeline exists for that data. Phase 1 can even launch on T-1 + T-3 alone (zero new ingest infrastructure); T-2 is added when explain-traffic or the lifecycle state machine requires it — this is the lowest-cost on-ramp.
+
+### Diagram 19 — Estate evidence plane (scale-aware)
 
 ```mermaid
 flowchart LR
-    SVCS[Banking services] --> PS[(Pub/Sub - enriched envelope + lifecycle topics)]
+    SVCS[Banking services - 15 crore envelopes per day] --> PS[(Pub/Sub topic - attributes: event_class, rail, lifecycle_stage, success)]
     SVCS --> CLOG[(Cloud Logging - structured JSON)]
-    PS --> BQ[(BigQuery - partitioned by day, clustered by journey_id, transaction_id_tok)]
-    PS --> SUB[evidence ingest subscriber - Go]
-    SUB --> HOT[(PostgreSQL hot store - txn_trace_map, transaction_event, 35-day retention)]
-    EV[evidence-service] --> HOT
-    EV -->|cold / ad hoc| BQ
-    EV -->|log detail by trace_id| CLOG
+    PS -->|existing pipeline - unchanged, sunk cost| BQ[(BigQuery T-3 - partition by ingestion day + require_partition_filter, cluster by transaction_id_tok, journey_id, 90-day raw expiry then aggregates)]
+    PS -->|FILTERED subscription - payment_lifecycle OR success=false only, approx 5-10 percent| SUB[evidence ingest subscriber - Go, idempotent upsert by event_id]
+    SUB --> HOT[(PostgreSQL T-2 - daily partitions, partition drop not DELETE, 35-day retention)]
+    EV[evidence-service] -->|1st: cache| RC[(Redis T-1 - assembled JourneyTrace, TTL 2h)]
+    EV -->|2nd: recent payments| HOT
+    EV -->|3rd: lazy point lookup, max bytes billed| BQ
+    EV -->|rare: log detail by trace_id| CLOG
     EV --> ALLOW[attribute allow-list + tokenisation + typed Evidence Objects]
     ALLOW --> TGWX[tool-gateway] --> ORCHX[agent-orchestrator / LLM - never touches PS, BQ or Logging directly]
 ```
 
-- **Hot path (conversation SLO):** `getJourneyTrace`/`resolveJourney` must answer in P95 ≤ 800 ms (§26). BigQuery alone cannot guarantee that interactively, so the ingest subscriber materialises `txn_trace_map` and `transaction_event` into PostgreSQL as events arrive (same tables as V.5 — only the feed changes from Kafka consumer to Pub/Sub subscriber). Retention ≤ 35 days hot; BQ is the system of record for history.
-- **Cold path:** taxonomy gap mining, golden-set mining, KPI dashboards run on BigQuery (already the bank's analysis plane) — this *replaces* the blueprint's "ClickHouse → BigQuery export" hop; the data is already there.
-- **Log detail:** when a trace needs raw-log corroboration, `evidence-service` calls the Cloud Logging API filtered by `trace_id`/`journey_id` labels, applies the attribute allow-list, and discards the rest. OPTION if Logging API latency/quota bites: a Logging sink of the allow-listed fields into the same BQ dataset.
-- **Unchanged guardrails:** the model calls tools; tools call `evidence-service`; `evidence-service` is the **only** workload with BigQuery/Logging read IAM (X.3). Raw logs, raw envelopes and free-form SQL never reach the LLM (§21.4, SEC).
+### X.5.2 Volume and sizing math (ASSUMPTIONS, to be replaced by measured numbers — open question E-6)
+
+| Quantity | Assumption | Result |
+|---|---|---|
+| Daily envelopes | 15 crore (150M) in the **12 daytime hours** + a small night fraction, avg ~1 KB | ~150–165 GB/day published ≈ 4.5–5 TB/month (storage/ingest cost is set by daily volume, unchanged by the diurnal shape) |
+| Rate profile (diurnal, E7) | 150M ÷ 43,200 s ≈ **3,472/s daytime average**; night trough a small fraction of that | **Design target = 12,000 events/s peak (stated, E7)** ≈ 3.5× the daytime average ≈ **12 MB/s** at ~1 KB/event. Well within Pub/Sub and BQ ingest norms; **the risk is cost and OLTP write amplification, not feasibility**. Salary-day/festival exceedances beyond 12k/s: measure (E-6) and rely on backlog absorption below |
+| Peak absorption at 12k/s | Pub/Sub backlog is the shock absorber | At peak, the **filtered** T-2 subscription sees ~600–1,200 events/s (5–10% share) — trivially handled by a few subscriber replicas with batched upserts. The subscriber does **not** need to match the full-firehose peak instantaneously: a bounded backlog (e.g. ≤ 60 s) during spikes is acceptable because T-2 freshness SLO is "recent", not "real-time"; the customer-facing hot path reads stores, not the stream |
+| Elasticity | Subscriber + `evidence-service` on HPA; night minimum 1–2 replicas | Compute is paid roughly in proportion to the **average** (≈ half the peak-sized fleet-hours), not the peak — the diurnal shape is a cost advantage, not a problem |
+| Night trough (~12 h) | Near-idle stream | Free capacity window for all heavy batch: C6 aggregate builds, taxonomy gap mining, golden-set mining, T-2 partition drops, BQ scheduled queries, model evals/red-team runs — **schedule nothing heavy in daytime hours** |
+| Payment-lifecycle + failure share | 5–10% (`event_class` filter, X.4) | TJSA filtered subscription delivers ~7.5–15M events/day ≈ 8–15 GB/day |
+| T-2 PostgreSQL | 15M rows/day × 35 days ≈ ~500M rows | Comfortably served by daily **native partitions** + partition **drop** (never `DELETE`), indexes only on `(transaction_id_tok)`, `(journey_id)`; a modest Cloud SQL/AlloyDB instance — vs. an unfiltered design needing 5+ billion rows |
+| T-3 BQ point lookup | Clustered on `transaction_id_tok` → scans MBs, not TBs | Even 1 lakh investigations/day ≈ negligible on-demand query cost |
+| Pub/Sub delta | Filtered subscription ~0.25–0.45 TB/month delivered | Marginal; an **unfiltered** second full subscription (4.5 TB/month) is prohibited (X.9) mainly for the downstream write amplification it invites |
+
+### X.5.3 Cost engineering controls (binding checklist)
+
+| # | Control | Where | Why it saves money |
+|---|---|---|---|
+| C1 | **Reuse the existing Pub/Sub→BQ pipeline as-is** — TJSA adds zero copies of the firehose | X.4 | The 4.5 TB/month ingest is already paid for; never duplicate it |
+| C2 | **Attribute-based subscription filters** (`event_class = "payment_lifecycle" OR success = "false"`) | Pub/Sub | TJSA consumes 5–10%, not 100%; no consume-and-discard compute |
+| C3 | **BigQuery subscription (Pub/Sub → BQ direct)** for any *new* TJSA topics (`tjsa-decision-v1` etc.) | Pub/Sub | No Dataflow job to run/babysit for simple sink paths; if the bank's existing pipeline uses Dataflow, that stays — but TJSA doesn't add more |
+| C4 | Partition by ingestion day + **`require_partition_filter = true`**; **cluster by `transaction_id_tok`, `journey_id`** | BQ telemetry tables | Point lookups scan MBs; accidental full scans are impossible |
+| C5 | **`maximum_bytes_billed`** set on every `evidence-service` query; only parameterised, pre-approved query templates (no free SQL — also a SEC control) | `evidence-service` | Hard cap on runaway query cost; predictable spend |
+| C6 | **Raw-table expiry 90 days** → nightly scheduled query into slim aggregate/error tables for taxonomy mining and KPIs; long-term storage discount applies automatically to untouched partitions | BQ | Storage is the dominant BQ cost at this volume; keep raw short, aggregates long |
+| C7 | **Physical (compressed) storage billing** on the telemetry dataset if compression ratio > 2× (typical for JSON envelopes) | BQ | Often 30–60% storage saving at no functional cost |
+| C8 | T-2 **daily partitions dropped, never deleted**; no autovacuum storms, no bloat | PostgreSQL | Keeps the hot store small and the instance modest |
+| C9 | **Redis first** — every repeated turn served from T-1; BQ/PG touched once per investigated transaction | `evidence-service` | Query cost scales with *unique* transactions asked about, not turns |
+| C10 | On-demand BQ pricing to start; move to **BI Engine / slot reservation only on measured spend or latency evidence** | BQ | Don't pre-buy capacity for a load that questions, not traffic, will drive |
+| C11 | Cloud Logging: TJSA reads via **scoped log views** on existing buckets; no new log sinks unless the Logging API path proves hot (then sink only allow-listed fields to BQ) | Logging | Avoid double-storing 150 GB/day of logs |
+| C12 | **Exploit the diurnal shape (E7)**: HPA on ingest subscriber and `evidence-service` with low night minimums; all scheduled/batch work (C6 aggregates, gap/golden-set mining, partition drops, evals) pinned to the night trough; accept bounded subscriber backlog (≤ 60 s) at daytime peaks instead of peak-sized fleets | GKE + BQ schedules | Pay for the average, serve the peak; night compute is effectively free headroom |
+
+- **Cold path:** taxonomy gap mining, golden-set mining, KPI dashboards run as **scheduled queries on BigQuery** (the data is already there) over the C6 aggregate tables — this *replaces* the blueprint's "ClickHouse → BigQuery export" hop entirely.
+- **Log detail:** when a trace needs raw-log corroboration, `evidence-service` calls the Cloud Logging API filtered by `trace_id`/`journey_id` labels, applies the attribute allow-list, and discards the rest (C11).
+- **Unchanged guardrails:** the model calls tools; tools call `evidence-service`; `evidence-service` is the **only** workload with BigQuery/Logging read IAM (X.3). Raw logs, raw envelopes and free-form SQL never reach the LLM (§21.4, SEC). C5's query templates double as the enforcement point.
+
+### X.5.4 Scale anti-patterns (prohibited at E7 volume)
+
+1. **No unfiltered second subscription** delivering all 15 crore events/day to TJSA "just in case".
+2. **No firehose → PostgreSQL/OLTP**: T-2 receives only the filtered slice; anything needing the full stream belongs in BQ (already there).
+3. **No per-turn BigQuery queries**: assemble once, cache in Redis (C9).
+4. **No unpartitioned/unclustered scans**: C4 makes them structurally impossible.
+5. **No new Dataflow pipelines for simple sinks** (C3), and no parallel Kafka/ClickHouse estate (X.9 #4).
+6. **No premature capacity purchases** (BI Engine, slots, bigger PG) before measured evidence (C10).
 
 ## X.6 Channel changes (thin, additive)
 
@@ -5255,13 +5314,14 @@ Every hop must **forward** (never strip, never regenerate) `x-journey-id`, `trac
 3. **No re-implementation** of login, OTP limits, device hashing, step-up — call existing services via `tool-gateway`.
 4. **No mandatory ClickHouse/Kafka build-out:** extend Pub/Sub schemas and add adapters (X.4–X.5). Introduce new stores only on measured SLO failure, via architecture review.
 5. **No raw envelope → prompt:** everything the model sees passes the Evidence Service allow-list and tokenisation.
+6. **No firehose materialisation:** at 15+ crore events/day, the scale anti-patterns in X.5.4 (unfiltered subscriptions, full-stream OLTP ingest, unclustered scans, per-turn BQ queries) are binding prohibitions, not guidance.
 
 ## X.10 Phase mapping on this estate and residual open questions
 
 | Phase | On this estate (delta to Volume VII) |
 |---|---|
-| 0 | Correlation headers end-to-end (X.8); Pub/Sub envelope enrichment + lifecycle topic (X.4); `evidence-service` as BQ/Logging/hot-store adapter (X.5); taxonomy for UPI + IMPS (or 2 highest-volume rails); Istio routes + `agent-platform` namespace with stubs (X.2–X.3); WAF review for chat payloads |
-| 1 | Explain-only + deep links + tickets on payments; GUIDE how-to for IMPS/beneficiary; cohort ramp via existing bucket routing (X.3); NGINX TJSA rate bucket live |
+| 0 | Correlation headers end-to-end (X.8); Pub/Sub envelope enrichment + `event_class` attribute + lifecycle topic (X.4); BQ telemetry tables re-clustered/partition-filtered per C4–C7; `evidence-service` in **lazy-hydration mode** (T-1 Redis + T-3 BQ only — no new ingest infrastructure); taxonomy for UPI + IMPS (or 2 highest-volume rails); Istio routes + `agent-platform` namespace with stubs (X.2–X.3); WAF review for chat payloads |
+| 1 | Explain-only + deep links + tickets on payments; GUIDE how-to for IMPS/beneficiary; cohort ramp via existing bucket routing (X.3); NGINX TJSA rate bucket live; add the **filtered T-2 hot store** (X.5.1) when the lifecycle state machine goes live or first-turn BQ latency breaches the async-UX budget |
 | 2+ | Safe confirmed actions (status refresh, dispute initiation) through `tool-gateway` against existing services; unchanged from VII.4+ |
 
 **Additional open questions raised by the estate (append to I.11):**
@@ -5273,6 +5333,10 @@ Every hop must **forward** (never strip, never regenerate) `x-journey-id`, `trac
 | E-3 | Cloud Logging retention & log-view scoping: are allow-listed fields available for ≥ 90 days to support disputes/audit (§22)? | Platform + compliance |
 | E-4 | Which LLM hosting satisfies data-residency on this GCP estate (Vertex AI region in-country vs in-VPC open-weight)? (Sharpens open question #1) | CISO + compliance |
 | E-5 | Streaming responses (SSE/WebSocket) through GLB→WAF→NGINX→ALB: supported end-to-end, or fall back to polling? | Network + platform |
+| E-6 | Measured envelope numbers to replace X.5.2 assumptions: average/percentile message size, the **full 24 h diurnal curve** (daytime average, night trough floor, and how often/how far salary-day or festival spikes exceed the stated 12k/s peak), and the actual share of payment-lifecycle + failure events in the stream | Platform + payments |
+| E-7 | Are the X.4 filter keys (`event_class`, `rail`, `lifecycle_stage`, `success`) settable as **message attributes** by today's producers, or is a producer-library change needed first? (Determines whether C2 filtering is a config change or a Phase 0 code change) | Platform + payments |
+| E-8 | Current BQ telemetry tables: partitioning/clustering scheme, storage billing model (logical vs physical), and raw retention — what must change to meet C4–C7? | Data platform |
+| E-9 | Is the existing Pub/Sub→BQ hop direct (BigQuery subscription) or via Dataflow? (Affects C3 and where enrichment fields are added) | Data platform |
 
 ---
 
