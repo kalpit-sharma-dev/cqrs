@@ -7,7 +7,7 @@
 | Field | Value |
 |---|---|
 | Document status | Architecture baseline / implementation-ready specification |
-| Version | 2.2 (supersedes ChatGPT-generated Master Specification v1.0 and TJSA PRD Draft v1; 2.1 = completeness pass against S3 master prompt; 2.2 = GUIDE/INFORM help modes — how-to task guidance) |
+| Version | 2.3 (supersedes ChatGPT-generated Master Specification v1.0 and TJSA PRD Draft v1; 2.1 = completeness pass against S3 master prompt; 2.2 = GUIDE/INFORM help modes — how-to task guidance; 2.3 = brownfield integration with the bank's existing GCP estate, Volume X) |
 | Date | 19 September 2026 |
 | Product name | Autonomous Transaction & Journey Support Agent (TJSA) |
 | Channels in scope | Mobile Banking (React Native), Internet Banking (React); Contact Center copilot (Phase 4); IVR/WhatsApp (roadmap) |
@@ -36,6 +36,7 @@
 | Volume VII | Implementation Blueprint | Phase 0–5 plan, MVP, entry/exit criteria, Definition of Done, team, RACI |
 | Volume VIII | Scenarios and Final Design Test | 35 scenarios (12-stage format, incl. 9 how-to/guidance), sample conversations, 5 complete 16-stage end-to-end walkthroughs |
 | Volume IX | Appendices | Prompt stack, adversarial set, sample payloads, risks, KPIs, open questions, final architecture, traceability |
+| Volume X | Bank Estate Integration Addendum (GCP brownfield) | How TJSA is added to the bank's **existing, live, RBI-compliant** mobile app and GCP/GKE estate without rewriting the app, auth or edge; estate-specific reconciliations (Pub/Sub, BigQuery, Cloud Logging, NGINX/ALB/Istio path) |
 
 The 66-section structure mandated by the master prompt (F58) is fully covered; Appendix I.13 gives the section-to-volume traceability matrix.
 
@@ -63,6 +64,7 @@ This document consolidates four inputs. Nothing from any of them has been droppe
 | S2 | `banking-support-agent-system-prompt.md` — reference system prompt | Behavioural contract of the deployed agent (7-step workflow, hard boundaries, tone, channel awareness) | Highest for runtime behaviour |
 | S3 | `Prompt.txt` / `TJSA-End-to-End-Prompt.md` — 65-section master prompt | Required scope and coverage; 66-section output structure; requirement format; design test | Highest for scope and completeness |
 | S4 | `Autonomous_Banking_AI_Customer_Support_Master_Specification.docx` — ChatGPT-generated v1.0 | Extending input: 140-item requirements register, regulatory register R1–R7, T0–T4 risk tiers, canonical domain model, 20 scenarios, phase durations, RACI, DoD | Adopted where consistent with S1–S3; reconciled where not (see 0.5) |
+| S5 | Bank estate facts (stated by the bank, Sep 2026) | **Brownfield baseline**: live RBI-compliant mobile app; all auth/security controls in production; GCP multi-cluster GKE + ASM/Istio; edge chain GLB → firewall → WAF → ILB L7 → NGINX (rate limiting, reverse proxy, device-id→bucket hashing) → ALB L7/NEG (host/header/bucket-range routing) → Istio ingress/ASM gateway → VirtualService → service; app/service logs in Cloud Logging; per-request API req/resp + success/failure + start/end timestamps published to Pub/Sub → BigQuery; React UI calls backend APIs through these layers | **Highest for the runtime estate**: where S1–S4 name a technology whose role S5 already fulfils, the S5 estate is reused and the blueprint component becomes an adapter (Volume X) |
 
 ## 0.4 Binding platform decision: Go for the agent platform
 
@@ -95,6 +97,10 @@ Boundaries of the decision:
 | Response structure | explanation + deep link / action / ticket | 11-part template | JSON structured output | 11-part customer template (S3) rendered from the S4-style JSON `AgentResponse` object; Volume II §II.5. |
 | Single vs multi-agent | Single orchestration layer | Evaluate; avoid unnecessary complexity | Single orchestrator + deterministic services | **Single orchestrator** with deterministic domain services; sub-agents rejected for v1 (Volume IV §25.6). |
 | Human re-authentication | Never re-authenticate; reuse channel session | Identity layer | FR-001 "authenticate and resolve customer context" | Agent **consumes** channel session (S1/S2). Step-up authentication for T3 actions is invoked via the bank's existing auth service, never by the agent itself. |
+| Event backbone | Kafka lifecycle topics | event-driven architecture | Kafka | **S5: Pub/Sub is the event bus.** Every Kafka topic in this document maps to a Pub/Sub topic of the same logical name (`txn.lifecycle.v3`, `tjsa.decision.v1`, `tjsa.gap.v1`, `tjsa.action.v1`); schema governance via Pub/Sub schemas. Volume X §X.4. |
+| Telemetry / evidence store | ClickHouse/Elasticsearch (+ BigQuery analytics) | observability stores | ClickHouse | **S5: Cloud Logging + Pub/Sub → BigQuery is the telemetry plane.** The Evidence Service queries BigQuery (hot, partitioned) and the Cloud Logging API instead of ClickHouse; no new store is built unless evidence-query latency SLOs are missed (fallback OPTION: BigQuery BI Engine / a serving cache). Volume X §X.5. |
+| Edge / API gateway | Generic "API Gateway/WAF" | API gateway | API gateway | **S5: the existing edge chain (GLB → FW → WAF → ILB → NGINX → ALB → Istio/ASM) is the gateway.** TJSA is added as new Istio VirtualService routes behind the same chain; no new edge components. Volume X §X.2. |
+| Streaming/deployment platform | Kubernetes (GKE) | Kubernetes | GKE | **S5 confirms**: multi-cluster GKE + ASM; TJSA services deploy as ordinary workloads behind the mesh. Volume X §X.3. |
 
 ## 0.6 Regulatory and control context (India)
 
@@ -1679,6 +1685,8 @@ sequenceDiagram
 
 ### 21.1 Diagram 6 — Observability architecture
 
+> **Estate adaptation (S5, binding — Volume X §X.4–X.5).** In this bank, "Kafka" = **Pub/Sub**, "ClickHouse/ES" = **BigQuery (+ Cloud Logging API)**, and "OTel Collectors" = Cloud Logging/Cloud Trace exporters where OTel is not yet rolled out. The per-request API envelope the bank already publishes to Pub/Sub (req/resp metadata, success/failure, start/end timestamps) is the seed of the APIExecution record; it is enriched, not replaced.
+
 ```mermaid
 flowchart LR
     CL[RN / React client - generate x-journey-id + traceparent] --> GW[API Gateway]
@@ -2519,7 +2527,8 @@ Rules: built per turn by Customer Context Service; cached in Redis for the conve
 | Ticketing/CRM | ServiceNow / JIRA / internal CRM (Open Question 2) | Write (create), Read (status poll) | REST; idempotency key = journey_id + taxonomy_id + day |
 | RN app | Chat/voice entry point; deep-link handler; "Explain this transaction" CTA | Bi-directional | SSE/WebSocket to Agent Gateway; `bankapp://` links |
 | React web | Same via web routing | Bi-directional | Same; `/payments/...` routes |
-| Observability stack | OTel collectors, Kafka, ClickHouse/Elasticsearch, Grafana, BigQuery | Read (Evidence Service), Write (agent telemetry) | Reuse; allow-listed attributes |
+| Observability stack | **This bank (S5): Cloud Logging + Pub/Sub → BigQuery** (pattern equivalents: OTel collectors, Kafka, ClickHouse/ES, Grafana) | Read (Evidence Service via BigQuery/Logging APIs), Write (agent telemetry) | Reuse; allow-listed attributes; Volume X §X.5 |
+| Edge chain | GLB (network team) → firewall → WAF → ILB L7 → NGINX → ALB L7/NEG → Istio ingress/ASM | TJSA traffic transits unchanged; new VirtualService routes only | No new edge components; Volume X §X.2 |
 | KMS/encryption layer | Cloud KMS, AES-256-GCM envelope encryption, HMAC-SHA256 searchable tokens | Read/Write | Reuse existing tokenisation service |
 | Incident management | Enterprise incident system (ITSM) | Read (active incidents), Write (auto case in incident mode) | Webhook + REST |
 | Notification | Push/SMS/email platform | Write (L2 notify-on-change) | Existing notification service |
@@ -2603,6 +2612,8 @@ Tracked per turn: conversation ID · investigation ID · model · prompt version
 Dashboards (Grafana / AI Log Analyzer): deflection rate · classification accuracy vs taxonomy fallback rate · hallucination / unsupported-claim rate · false diagnosis rate · escalation rate · resolution rate · tool failure rate · autonomous action success / rollback · P50/P95 by class · token cost per conversation · guardrail block rate by layer. Alerts: `UNCLASSIFIED_ERROR` spike → owning team; unsafe action attempts; guardrail spikes; latency SLO burn.
 
 ## §49 Deployment Architecture
+
+> **Estate adaptation (S5, binding).** TJSA deploys into the bank's **existing multi-cluster GKE + ASM/Istio** estate as a new `agent-platform` namespace behind the existing edge chain (GLB → firewall → WAF → ILB → NGINX → ALB → Istio ingress). "API Gateway" in Diagram 13 is that chain, not a new component. Traffic reaches the agent via new Istio VirtualService routes (`/v1/tjsa/**`); everything else in the diagram is unchanged. Full insertion design: Volume X §X.2–X.3.
 
 ### Diagram 13 — Deployment architecture
 
@@ -2710,8 +2721,8 @@ Pipeline: GitHub/GitLab → Cloud Build → Artifact Registry (signed images, co
 | Embedding model | Vertex/Bedrock embedding or in-VPC | Same hosting decision | — |
 | Vector DB | PostgreSQL + pgvector (MVP) | Low ops burden; RAG is low-QPS here | Qdrant / Vertex Vector Search at scale |
 | Knowledge graph | Neo4j (Go driver) | Mature Cypher tooling for dependency traversal | Dgraph (Go-native), Neptune |
-| Event streaming | Kafka (existing) | Reuse | — |
-| Observability | OTel + ClickHouse/ES + Grafana + AI Log Analyzer (existing) | Reuse | — |
+| Event streaming | **This bank (S5): Pub/Sub (existing)** — pattern name in this document: Kafka | Reuse; add/enrich lifecycle topics (Volume X §X.4) | Kafka only if the bank later standardises on it |
+| Observability | **This bank (S5): Cloud Logging + Pub/Sub → BigQuery (existing)** — pattern names: OTel + ClickHouse/ES + Grafana | Reuse; Evidence Service reads BigQuery/Logging (Volume X §X.5) | ClickHouse/ES only if BQ evidence-query SLOs are missed |
 | Cache | Redis (Memorystore) | Session/memory/locks/hot taxonomy | — |
 | Case management | Bank's system of record (ServiceNow/JIRA/CRM) | Open question #2 | — |
 | Relational | Cloud SQL PostgreSQL | Registries, ledger, audit | Spanner if global scale needed |
@@ -4081,6 +4092,8 @@ gantt
 
 **Objective.** Make the estate diagnosable before any AI is added; stand up the Go platform skeleton.
 
+> **Estate adaptation (S5, binding).** On this bank's stack, Phase 0 concretely means: (a) W0.1 propagates `x-journey-id`/`traceparent` through **NGINX → ALB → Istio → services** and into **Cloud Logging labels and the existing per-request Pub/Sub envelope**; (b) W0.2's "Kafka `txn.lifecycle.v3`" is a **new/enriched Pub/Sub topic** — the existing API req/resp envelope is necessary but not sufficient (it lacks rail, error code, debit state, lifecycle stage); (c) W0.6's Evidence Service is built as a **BigQuery + Cloud Logging adapter**, not ClickHouse; (d) Istio VirtualService/DestinationRule routes for TJSA stubs are stood up in this phase so later phases are pure workload deployments. Details and schemas: Volume X §X.4–X.7.
+
 **Entry criteria.** Executive sponsor; open questions #1–#3 owners assigned; access to OpenAPI/Java contracts and observability stack.
 
 **Workstreams and deliverables.**
@@ -5045,9 +5058,221 @@ Additional S3 §1 objective items without a numbered §58 slot: Customer-context
 | 65 | Sample Dashboards | §46, I.10 |
 | 66 | Final Recommendations | I.12 |
 
-Diagram index (S3 §57 minimum set): 1 Overall architecture (§14.2) · 2 Customer request flow (§14.3) · 3 Agent orchestration flow (§25.1) · 4 Transaction investigation flow (§20.5) · 5 API intelligence architecture (§17.3) · 6 Observability architecture (§21.1) · 7 Knowledge architecture (§16.2) · 8 Knowledge graph (§37.3) · 9 UI guidance architecture (§19.2) · 10 Corrective action architecture (§27.1) · 11 Ticketing architecture (§28.1) · 12 Security architecture (§30.1) · 13 Deployment architecture (§49) · 14 Data flow (§14.4) · 15 Incident correlation flow (§39) · 16 End-to-end transaction reconstruction (§20.3) · 17 Multi-channel architecture (§41) · plus state diagram (§24.2), ER model (§15.1), conversation contract (II.3), continuous-learning loop (§55), Gantt (VII.1), final architecture (I.12).
+Diagram index (S3 §57 minimum set): 1 Overall architecture (§14.2) · 2 Customer request flow (§14.3) · 3 Agent orchestration flow (§25.1) · 4 Transaction investigation flow (§20.5) · 5 API intelligence architecture (§17.3) · 6 Observability architecture (§21.1) · 7 Knowledge architecture (§16.2) · 8 Knowledge graph (§37.3) · 9 UI guidance architecture (§19.2) · 10 Corrective action architecture (§27.1) · 11 Ticketing architecture (§28.1) · 12 Security architecture (§30.1) · 13 Deployment architecture (§49) · 14 Data flow (§14.4) · 15 Incident correlation flow (§39) · 16 End-to-end transaction reconstruction (§20.3) · 17 Multi-channel architecture (§41) · 18 Estate traffic insertion (X.2) · 19 Estate evidence plane (X.5) · plus state diagram (§24.2), ER model (§15.1), conversation contract (II.3), continuous-learning loop (§55), Gantt (VII.1), final architecture (I.12).
 
-Source coverage: S1 PRD §1–§17 (I.1–I.5, I.8, §14, §17, §22, §26, II.8, II.9, III.0, VII, VII.9, I.11); S2 system prompt (I.1 verbatim + extensions); S3 65 sections (this matrix); S4 §1–§29 + Appendices A–D (0.6, I.7, I.10, III.1–III.15, II.2–II.5, §14.5, §15, §24, §17.1, §21.1–21.4, §26, §25.2–25.3, §30, §33.1, V.1, V.15, V.11, §23, §16, §19, §27, §28, §29, VIII.1–VIII.2, V.17, VI.6, II.9, §49, §50, I.8, VII, VII.10, I.9, I.10, I.11, I.12, I.1, I.3, I.4, VII.8, 0.6).
+Source coverage: S1 PRD §1–§17 (I.1–I.5, I.8, §14, §17, §22, §26, II.8, II.9, III.0, VII, VII.9, I.11); S2 system prompt (I.1 verbatim + extensions); S3 65 sections (this matrix); S4 §1–§29 + Appendices A–D (0.6, I.7, I.10, III.1–III.15, II.2–II.5, §14.5, §15, §24, §17.1, §21.1–21.4, §26, §25.2–25.3, §30, §33.1, V.1, V.15, V.11, §23, §16, §19, §27, §28, §29, VIII.1–VIII.2, V.17, VI.6, II.9, §49, §50, I.8, VII, VII.10, I.9, I.10, I.11, I.12, I.1, I.3, I.4, VII.8, 0.6); S5 bank estate facts (Volume X, 0.5 reconciliations, §21.1, §49, §IP, §51, VII.2 estate adaptations).
+
+---
+
+# VOLUME X — BANK ESTATE INTEGRATION ADDENDUM (GCP BROWNFIELD)
+
+This volume is **binding** for this bank's deployment. It answers one question — *"our mobile app, auth, security controls and GCP estate already exist, are live and RBI-compliant; can we add TJSA?"* — and specifies exactly how. Everywhere this volume conflicts with a generic technology name in Volumes I–IX (Kafka, ClickHouse, "API Gateway"), **this volume wins** (source S5, precedence per 0.3).
+
+## X.1 Verdict and estate facts
+
+**Verdict: yes.** TJSA is added as a new set of Go services beside the existing payment/ledger microservices and a thin new surface in the existing app. Nothing in the app, auth stack, security edge or RBI-compliance posture is rewritten.
+
+| Question | Answer |
+|---|---|
+| Possible without rewriting the mobile app? | **Yes** — app change is a chat surface + deep-link handler + header propagation (X.6) |
+| Reuse existing auth / WAF / Istio / RBI controls? | **Yes — mandatory** (X.7; SEC requirements apply unchanged) |
+| Reuse Cloud Logging + Pub/Sub → BigQuery? | **Yes** — they are the observability backbone; the Evidence Service adapts to them (X.5) |
+| Agent traffic through the same edge path? | **Yes** — new Istio routes behind the same GLB→…→Istio chain (X.2) |
+| New edge, gateway, login, OTP or rate-limit infrastructure? | **No** — prohibited (X.9) |
+
+**Estate facts (S5, FACT):**
+
+| # | Fact |
+|---|---|
+| E1 | Live RBI-compliant mobile app serving customers; React UI calls backend APIs through the layered edge |
+| E2 | All authentication mechanisms and security controls exist in production |
+| E3 | All microservices on GCP as Kubernetes workloads: **multi-cluster GKE + ASM/Istio** |
+| E4 | Edge chain: **User App → GLB (managed by network team, no direct access) → firewall rule matching → WAF → ILB L7 (equal distribution, unmanaged instance group of VMs) → NGINX (reverse proxy; rate limiting e.g. OTP/GET 10/min; device-id hashed to bucket-id) → ALB L7 with NEGs (host routing e.g. UAT1/mby3; header-based routing e.g. `put=true`; regex match on bucket-id range decides route) → Istio ingress gateway → ASM gateway → VirtualService (paths, destination rules) → service** |
+| E5 | Application and service logs in **Cloud Logging** |
+| E6 | For **every** request, an API envelope (request/response metadata, success/failure, start/end timestamps) is published to **Pub/Sub**, then lands in **BigQuery** for querying and analysis |
+
+## X.2 Traffic insertion — TJSA behind the existing edge
+
+### Diagram 18 — Estate traffic insertion
+
+```mermaid
+flowchart TB
+    APP[Mobile app / React UI - existing session JWT + new Ask TJSA chat surface]
+    APP --> GLB[GLB - network team, unchanged]
+    GLB --> FW[Firewall rules - unchanged]
+    FW --> WAF[WAF - unchanged]
+    WAF --> ILB[ILB L7 - unchanged]
+    ILB --> NGX[NGINX - reverse proxy - ADD tjsa rate-limit bucket]
+    NGX --> ALB[ALB L7 NEG - host and header and bucket-range routing - unchanged rules apply to tjsa host or path]
+    ALB --> IGW[Istio ingress gateway - existing]
+    IGW --> ASM[ASM gateway - existing]
+    ASM --> VS[VirtualService - ADD tjsa routes]
+    VS -->|/v1/tjsa/**| AGW[agent-gateway - NEW Go service]
+    VS -->|/payments/** etc| SVC[Existing banking services - unchanged]
+    AGW --> ORCH[agent-orchestrator and TJSA platform services - NEW namespace agent-platform]
+    ORCH --> TGW[tool-gateway] --> SVC
+```
+
+**Per-layer change list (this table is the network/platform work order):**
+
+| Layer | Owner | Change for TJSA |
+|---|---|---|
+| GLB | Network team | **None.** TJSA rides existing frontends/certs. If a dedicated host (e.g. `tjsa.<bank>.in`) is chosen instead of path-based routing, network team adds the host mapping — the only GLB-adjacent task. |
+| Firewall / WAF | Security | **None structurally.** Review WAF rules against chat payloads (free-text bodies, SSE/WebSocket if streaming is enabled); add TJSA paths to the existing inspection profile. |
+| ILB L7 | Platform | **None** (no rules today; equal distribution continues). |
+| NGINX | Platform | Add a **TJSA rate-limit bucket** using the same mechanism as the OTP limit: e.g. `POST /v1/tjsa/converse` ≤ N turns/min/device, stricter limits on action-confirmation endpoints. Reuse the existing device-id→bucket-id hashing untouched — it becomes TJSA's cohort key (X.3). Ensure `proxy_set_header` forwards `x-journey-id`, `traceparent`, `tracestate` (X.8). |
+| ALB L7 (NEG) | Platform | **No new rule engine.** TJSA requests carry the same bucket-id header, so existing regex bucket-range routing sends them to the right cluster automatically. Verify header-based rules (e.g. `put=true`) do not shadow `/v1/tjsa/**`. |
+| Istio ingress / ASM gateway | Platform | Reuse existing Gateway resources (same hosts/certs). |
+| VirtualService / DestinationRule | TJSA team + platform | **The only new routing config** — see sketch below. |
+| Services | TJSA team | New `agent-platform` namespace workloads (X.3). Existing banking services unchanged; they are called by `tool-gateway` exactly as the app calls them today. |
+
+**Istio VirtualService sketch (illustrative, to be adapted to the bank's naming):**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: tjsa
+  namespace: agent-platform
+spec:
+  hosts: ["app-api.<bank>.in"]            # same host the app already calls
+  gateways: ["istio-system/asm-gateway"]  # existing gateway, reused
+  http:
+    - match: [{ uri: { prefix: "/v1/tjsa/" } }]
+      route:
+        - destination: { host: agent-gateway.agent-platform.svc.cluster.local, port: { number: 8443 } }
+      timeout: 30s                        # sync budget; async path beyond (§26)
+      retries: { attempts: 0 }            # no blind retries on conversational POSTs
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: agent-gateway
+  namespace: agent-platform
+spec:
+  host: agent-gateway.agent-platform.svc.cluster.local
+  trafficPolicy:
+    tls: { mode: ISTIO_MUTUAL }           # mesh mTLS, same as every other service
+    connectionPool: { http: { http2MaxRequests: 1000 } }
+    outlierDetection: { consecutive5xxErrors: 5, interval: 30s }
+```
+
+## X.3 Deployment on multi-cluster GKE + ASM
+
+- **Namespace:** `agent-platform` per cluster, mesh-injected, `STRICT` mTLS PeerAuthentication, AuthorizationPolicies allowing only `asm-gateway` → `agent-gateway` and `tool-gateway` → named banking services (deny-by-default, per §30).
+- **Identity/IAM:** Workload Identity per service; least-privilege grants — `evidence-service` gets `roles/bigquery.dataViewer` on the telemetry dataset and `roles/logging.viewer` scoped by log-view; `model-gateway` gets **no** data-store IAM at all (enforces §21.4 "model never touches stores" at the IAM layer, not just network policy).
+- **Multi-cluster rollout & canary:** the estate's existing **device-id→bucket-id hashing + ALB bucket-range routing is the canary mechanism**. Phase 1's 1% → 100% cohort ramp (VII.3) is implemented by enabling the TJSA entry point for selected bucket ranges — no new experimentation infrastructure. DESIGN DECISION: reuse bucket routing for cohorts; Istio traffic-splitting remains available for service-level canaries within a cluster.
+- **Environments:** the existing host-routing scheme (UAT1 etc.) applies unchanged; TJSA gets the same per-environment hosts, with the Prompt Registry / Policy bundles versioned per environment (V.16).
+- **Kill switch (AG-xxx / §54):** implemented as a config flag in `agent-gateway` **and** an Istio route removal runbook — two independent paths to dark.
+
+## X.4 Pub/Sub as the event bus
+
+**DESIGN DECISION (binding).** Pub/Sub is the event backbone. Every "Kafka" topic named in Volumes IV–V maps 1:1 to a Pub/Sub topic; ordering keys = `transaction_id_tok`; schema governance via Pub/Sub schemas (Avro/JSON) with the same compatibility rules as V.6; exactly-once via idempotent upserts keyed by `event_id` (unchanged from §14.1.2).
+
+| Blueprint (pattern) topic | Pub/Sub topic | Producer | Consumers |
+|---|---|---|---|
+| `txn.lifecycle.v3` | `txn-lifecycle-v3` | Payment/ledger services (enriched envelope, below) | `transaction-intelligence`, BQ sink, alerting |
+| `tjsa.decision.v1` | `tjsa-decision-v1` | `agent-orchestrator`, `taxonomy-service` | audit sink, BQ analytics, learning pipeline |
+| `tjsa.gap.v1` | `tjsa-gap-v1` | `taxonomy-service` | admin console, learning pipeline |
+| `tjsa.action.v1` | `tjsa-action-v1` | `action-workflow` | audit sink, ops alerting |
+
+**Envelope enrichment (the critical Phase 0 data task).** Today's per-request envelope (E6) proves an API call happened; it cannot answer *why a transfer failed*. Extend the existing message schema — do not create a parallel pipeline — with:
+
+| Field | Type | Why |
+|---|---|---|
+| `journey_id` | string (UUID) | One id across UI → NGINX → ALB → Istio → all services for one customer journey (W0.1) |
+| `traceparent` / `trace_id` | string | Join to Cloud Trace / spans |
+| `transaction_id_tok` | string (HMAC token) | Customer-visible txn id, tokenised — the key the agent resolves from |
+| `rail` | enum | UPI / IMPS / NEFT / RTGS / BILLPAY / CARD |
+| `lifecycle_stage` | enum | initiated / processing / completed / failed / pending / reversed / refunded / settled |
+| `debit_state` | enum | none / debited / reversed — the "did money move" answer |
+| `error_code`, `error_source` | string | Service+rail error code and originating hop → taxonomy lookup key |
+| `service`, `api`, `http_status`, `env`, `schema_version` | string/int | Already partially present; normalise names against `api_registry` |
+
+Existing fields (req/resp metadata, success/failure, start/end timestamps) are retained. PII rule unchanged: identifiers tokenised at source, payload bodies never published (DATA-xxx, §22).
+
+## X.5 Evidence Service over BigQuery + Cloud Logging
+
+**DESIGN DECISION (binding).** No ClickHouse/Elasticsearch build. The Evidence Service (`evidence-service`, §21.4, V) is implemented as an adapter over the estate's three data planes, with a small hot serving store for latency:
+
+### Diagram 19 — Estate evidence plane
+
+```mermaid
+flowchart LR
+    SVCS[Banking services] --> PS[(Pub/Sub - enriched envelope + lifecycle topics)]
+    SVCS --> CLOG[(Cloud Logging - structured JSON)]
+    PS --> BQ[(BigQuery - partitioned by day, clustered by journey_id, transaction_id_tok)]
+    PS --> SUB[evidence ingest subscriber - Go]
+    SUB --> HOT[(PostgreSQL hot store - txn_trace_map, transaction_event, 35-day retention)]
+    EV[evidence-service] --> HOT
+    EV -->|cold / ad hoc| BQ
+    EV -->|log detail by trace_id| CLOG
+    EV --> ALLOW[attribute allow-list + tokenisation + typed Evidence Objects]
+    ALLOW --> TGWX[tool-gateway] --> ORCHX[agent-orchestrator / LLM - never touches PS, BQ or Logging directly]
+```
+
+- **Hot path (conversation SLO):** `getJourneyTrace`/`resolveJourney` must answer in P95 ≤ 800 ms (§26). BigQuery alone cannot guarantee that interactively, so the ingest subscriber materialises `txn_trace_map` and `transaction_event` into PostgreSQL as events arrive (same tables as V.5 — only the feed changes from Kafka consumer to Pub/Sub subscriber). Retention ≤ 35 days hot; BQ is the system of record for history.
+- **Cold path:** taxonomy gap mining, golden-set mining, KPI dashboards run on BigQuery (already the bank's analysis plane) — this *replaces* the blueprint's "ClickHouse → BigQuery export" hop; the data is already there.
+- **Log detail:** when a trace needs raw-log corroboration, `evidence-service` calls the Cloud Logging API filtered by `trace_id`/`journey_id` labels, applies the attribute allow-list, and discards the rest. OPTION if Logging API latency/quota bites: a Logging sink of the allow-listed fields into the same BQ dataset.
+- **Unchanged guardrails:** the model calls tools; tools call `evidence-service`; `evidence-service` is the **only** workload with BigQuery/Logging read IAM (X.3). Raw logs, raw envelopes and free-form SQL never reach the LLM (§21.4, SEC).
+
+## X.6 Channel changes (thin, additive)
+
+| Change | Where | Size |
+|---|---|---|
+| "Ask TJSA" chat surface + "Explain this transaction" CTA on txn detail/failure screens | Mobile app, React web | New screens; no change to existing flows |
+| Pass existing session JWT on `/v1/tjsa/**` calls | App networking layer | Config-level |
+| Generate `x-journey-id` + `traceparent` on **all** banking calls (not only TJSA) | App networking interceptor | Small; Phase 0 (W0.1) |
+| Deep-link handler for `bankapp://…` routes returned by `getUIDeepLink` | App router | Uses screens that already exist |
+| Screen-view breadcrumb events (for `IN_TASK_NEXT_STEP` guidance, §19.4) | Analytics layer | Optional Phase 1+, reuses existing analytics pipe |
+
+## X.7 Auth and security reuse (mandatory)
+
+- `agent-gateway` **validates the existing channel session** (OIDC/JWT) exactly as other backend APIs do — no second login, no TJSA-specific credential.
+- Step-up for T3 actions invokes the **bank's existing step-up/OTP service** via `tool-gateway` (already stated in 0.5; restated here as an estate fact, E2).
+- OTP rate limits, device hashing, WAF rules, firewall policy: consumed, never re-implemented.
+- The RBI compliance posture of the channel (E1–E2) is inherited; **Volume VI adds the AI-specific layer on top** (model hosting residency, no PII in prompts, agent decision audit, kill switch) — it does not restate or replace channel compliance.
+
+## X.8 Correlation header propagation checklist (Phase 0 gate)
+
+Every hop must **forward** (never strip, never regenerate) `x-journey-id`, `traceparent`, `tracestate`:
+
+| Hop | Mechanism | Verify |
+|---|---|---|
+| App → GLB → WAF → ILB | Opaque L7 pass-through | Confirm WAF does not strip custom headers |
+| NGINX | `proxy_set_header X-Journey-Id $http_x_journey_id;` etc. (add `traceparent`, `tracestate`) | Synthetic request test |
+| ALB | Header pass-through (default); ensure routing regexes don't consume/rewrite them | Synthetic request test |
+| Istio ingress / sidecars | Envoy propagates `traceparent` natively; add `x-journey-id` to mesh `tracing.customTags` / access-log format | Mesh telemetry check |
+| Go/Java services | Shared middleware (W0.1): read → log field → outbound header → Pub/Sub envelope field | CI log-schema linter |
+| Pub/Sub envelope | `journey_id`, `trace_id` attributes (X.4) | BQ join test: app-generated id ↔ BQ rows |
+
+**Exit test (part of Phase 0 DoD):** for a sampled real transfer, one `journey_id` joins app event → NGINX access log → Istio telemetry → every service log in Cloud Logging → Pub/Sub envelope → BigQuery row → `txn_trace_map`. If this join fails, the agent is limited to GUIDE/INFORM modes and must not answer "why did my transfer fail?".
+
+## X.9 Prohibited integration shortcuts
+
+1. **No path around the edge:** the LLM/agent endpoints must not be exposed except through GLB→WAF→…→Istio.
+2. **No direct data access for the model:** the model (and `model-gateway`) never gets BigQuery, Pub/Sub or Cloud Logging access — IAM-enforced (X.3).
+3. **No re-implementation** of login, OTP limits, device hashing, step-up — call existing services via `tool-gateway`.
+4. **No mandatory ClickHouse/Kafka build-out:** extend Pub/Sub schemas and add adapters (X.4–X.5). Introduce new stores only on measured SLO failure, via architecture review.
+5. **No raw envelope → prompt:** everything the model sees passes the Evidence Service allow-list and tokenisation.
+
+## X.10 Phase mapping on this estate and residual open questions
+
+| Phase | On this estate (delta to Volume VII) |
+|---|---|
+| 0 | Correlation headers end-to-end (X.8); Pub/Sub envelope enrichment + lifecycle topic (X.4); `evidence-service` as BQ/Logging/hot-store adapter (X.5); taxonomy for UPI + IMPS (or 2 highest-volume rails); Istio routes + `agent-platform` namespace with stubs (X.2–X.3); WAF review for chat payloads |
+| 1 | Explain-only + deep links + tickets on payments; GUIDE how-to for IMPS/beneficiary; cohort ramp via existing bucket routing (X.3); NGINX TJSA rate bucket live |
+| 2+ | Safe confirmed actions (status refresh, dispute initiation) through `tool-gateway` against existing services; unchanged from VII.4+ |
+
+**Additional open questions raised by the estate (append to I.11):**
+
+| # | Question | Owner (proposed) |
+|---|---|---|
+| E-1 | Dedicated TJSA host vs path prefix on the existing app host? (GLB/cert implications — network team has GLB access, TJSA team does not) | Network + platform |
+| E-2 | Does the current Pub/Sub envelope schema have room (and producer bandwidth) for the X.4 fields, or is a parallel enriched topic cleaner during migration? | Platform + payments |
+| E-3 | Cloud Logging retention & log-view scoping: are allow-listed fields available for ≥ 90 days to support disputes/audit (§22)? | Platform + compliance |
+| E-4 | Which LLM hosting satisfies data-residency on this GCP estate (Vertex AI region in-country vs in-VPC open-weight)? (Sharpens open question #1) | CISO + compliance |
+| E-5 | Streaming responses (SSE/WebSocket) through GLB→WAF→NGINX→ALB: supported end-to-end, or fall back to polling? | Network + platform |
 
 ---
 
